@@ -176,6 +176,16 @@ button.primary:disabled { opacity: 0.6; cursor: default; transform: none; }
 .snippet { font-size: 13px; color: var(--muted); line-height: 1.6; font-weight: 300; }
 .snippet mark { background: rgba(255,159,28,0.18); color: var(--orange); padding: 1px 3px; border-radius: 3px; }
 
+.source-badge {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  padding: 2px 8px;
+  border-radius: 10px;
+  background: rgba(255,255,255,0.06);
+  border: 1px solid var(--border);
+  color: var(--muted);
+}
 
 </style>
 </head>
@@ -287,6 +297,7 @@ function renderResults() {
         <div class="job-title"><a href="${job.url}" target="_blank" rel="noopener">${escapeHtml(job.title)}</a></div>
         <div class="job-meta">
           ${job.company ? `<span>🏢 ${escapeHtml(job.company)}</span>` : ""}
+          ${job.source ? `<span class="source-badge">${escapeHtml(job.source)}</span>` : ""}
           ${loc ? `<span>📍 ${escapeHtml(loc)}</span>` : ""}
           ${job.experience ? `<span>⏳ ${escapeHtml(job.experience)}</span>` : ""}
           ${job.salary ? `<span>💰 ${escapeHtml(job.salary)}</span>` : ""}
