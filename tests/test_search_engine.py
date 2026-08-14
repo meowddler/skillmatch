@@ -149,3 +149,199 @@ def test_empty_corpus_raises(tmp_path):
     eng = JobSearchEngine(data_path=path)
     with pytest.raises(DataLoadError, match="empty or malformed"):
         eng.load()
+
+
+# --- live records & background corpus ---------------------------------------
+
+def test_document_text_prefers_search_text():
+    from backend.search_engine import document_text
+
+    live = {"search_text": "python django api", "skills": ["ignored"]}
+    assert document_text(live) == "python django api"
+
+
+def test_document_text_falls_back_to_skills():
+    from backend.search_engine import document_text
+
+    archived = {"skills": ["Python", "Django"]}
+    assert document_text(archived) == "Python Django"
+
+
+def test_document_text_handles_missing_fields():
+    from backend.search_engine import document_text
+
+    assert document_text({}) == ""
+
+
+@pytest.fixture
+def live_engine(tmp_path):
+    """An engine over live-shaped records, with a larger background corpus."""
+    import json
+
+    live = [
+        {"title": "Python Developer", "url": "l1", "company": "Acme",
+         "snippet": "Django REST APIs", "category": "python developer",
+         "search_text": "Python Developer Acme Django REST APIs python developer"},
+        {"title": "Java Developer", "url": "l2", "company": "Globex",
+         "snippet": "Spring Boot services", "category": "java developer",
+         "search_text": "Java Developer Globex Spring Boot services java developer"},
+    ]
+    # "developer" is near-ubiquitous; "django" is rare. A realistic background
+    # corpus needs enough documents for that difference to register.
+    background = [{"skills": ["Developer", f"Filler{i}"]} for i in range(10)]
+    background[0]["skills"].append("Django")
+
+    live_path = tmp_path / "live.json"
+    bg_path = tmp_path / "bg.json"
+    live_path.write_text(json.dumps(live), encoding="utf-8")
+    bg_path.write_text(json.dumps(background), encoding="utf-8")
+
+    eng = JobSearchEngine(data_path=live_path, background_path=bg_path)
+    eng.load()
+    return eng
+
+
+def test_live_engine_indexes_search_text(live_engine):
+    assert len(live_engine.jobs) == 2
+    assert live_engine.search("django", top_k=1)[0]["title"] == "Python Developer"
+
+
+def test_background_corpus_is_used(live_engine):
+    assert live_engine.background_size == 10
+
+
+def test_rare_terms_outrank_common_terms(live_engine):
+    """
+    'Django' appears in one background document; 'developer' appears in the
+    live corpus generally. Background IDF should rank the rarer term higher.
+
+    Note: bm25.idf only holds terms present in the live corpus, so background
+    terms absent from it (e.g. "common") are not keys here.
+    """
+    idf = live_engine.bm25.idf
+    assert "django" in idf
+    assert idf["django"] > idf["developer"], (
+        f'django={idf["django"]:.3f} should exceed developer={idf["developer"]:.3f}'
+    )
+
+
+def test_engine_works_without_background(tmp_path):
+    """
+    Without a background corpus, BM25 falls back to live-corpus statistics.
+
+    Two documents are used rather than one: a term appearing in *every*
+    document of a corpus gets an IDF at or near zero, so a single-document
+    corpus scores everything 0 and returns nothing. That is BM25 behaving
+    correctly, and it is precisely the small-corpus problem the background
+    corpus exists to solve.
+    """
+    import json
+
+    path = tmp_path / "live.json"
+    path.write_text(
+        json.dumps([
+            {"title": "Solo", "url": "s1", "search_text": "python django"},
+            {"title": "Other", "url": "s2", "search_text": "java spring"},
+            {"title": "Third", "url": "s3", "search_text": "ruby rails"},
+        ]),
+        encoding="utf-8",
+    )
+    eng = JobSearchEngine(data_path=path, background_path=None)
+    eng.load()
+
+    assert eng.background_size == 0
+    assert len(eng.search("python", top_k=1)) == 1
+
+
+def test_single_document_corpus_scores_zero(tmp_path):
+    """Documented edge case: one document means zero IDF, so no results."""
+    import json
+
+    path = tmp_path / "one.json"
+    path.write_text(
+        json.dumps([{"title": "Solo", "url": "s1", "search_text": "python only"}]),
+        encoding="utf-8",
+    )
+    eng = JobSearchEngine(data_path=path, background_path=None)
+    eng.load()
+
+    assert eng.is_ready
+    assert eng.search("python") == []
+
+
+def test_missing_background_falls_back_gracefully(tmp_path):
+    """A missing background file should warn, not crash."""
+    import json
+
+    path = tmp_path / "live.json"
+    path.write_text(
+        json.dumps([{"title": "Solo", "url": "s1", "search_text": "python only"}]),
+        encoding="utf-8",
+    )
+    eng = JobSearchEngine(data_path=path, background_path=tmp_path / "nope.json")
+    eng.load()
+
+    assert eng.is_ready
+    assert eng.background_size == 0
+
+
+# --- data sources -----------------------------------------------------------
+
+def test_load_live_jobs_falls_back_when_supabase_unconfigured(monkeypatch, tmp_path):
+    """With no credentials set, loading should use the local snapshot."""
+    import backend.data_sources as ds
+
+    monkeypatch.delenv("SUPABASE_URL", raising=False)
+    monkeypatch.delenv("SUPABASE_KEY", raising=False)
+
+    snapshot = tmp_path / "snap.json"
+    snapshot.write_text(
+        '[{"title": "Local", "url": "u1", "search_text": "python local"}]',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(ds, "LIVE_SNAPSHOT", snapshot)
+
+    jobs, source = ds.load_live_jobs()
+    assert source == "local"
+    assert jobs[0]["title"] == "Local"
+
+
+def test_load_live_jobs_prefers_supabase(monkeypatch, tmp_path):
+    """When Supabase returns rows, the snapshot is not read."""
+    import backend.data_sources as ds
+
+    monkeypatch.setattr(
+        ds, "fetch_from_supabase",
+        lambda: [{"title": "Remote", "url": "r1", "search_text": "python remote"}],
+    )
+    monkeypatch.setattr(ds, "LIVE_SNAPSHOT", tmp_path / "does-not-exist.json")
+
+    jobs, source = ds.load_live_jobs()
+    assert source == "supabase"
+    assert jobs[0]["title"] == "Remote"
+
+
+def test_fetch_from_supabase_returns_empty_without_credentials(monkeypatch):
+    import backend.data_sources as ds
+
+    monkeypatch.delenv("SUPABASE_URL", raising=False)
+    monkeypatch.delenv("SUPABASE_KEY", raising=False)
+    assert ds.fetch_from_supabase() == []
+
+
+def test_engine_reports_source(tmp_path):
+    """An explicit data_path bypasses Supabase and reports 'local'."""
+    import json
+
+    path = tmp_path / "live.json"
+    path.write_text(
+        json.dumps([
+            {"title": "A", "url": "a", "search_text": "python django"},
+            {"title": "B", "url": "b", "search_text": "java spring"},
+            {"title": "C", "url": "c", "search_text": "ruby rails"},
+        ]),
+        encoding="utf-8",
+    )
+    eng = JobSearchEngine(data_path=path, background_path=None)
+    eng.load()
+    assert eng.source == "local"

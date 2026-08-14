@@ -172,6 +172,11 @@ button.primary:disabled { opacity: 0.6; cursor: default; transform: none; }
   background: rgba(255, 78, 80, 0.1); border: 1px solid rgba(255, 78, 80, 0.25);
   color: #ff7b7c; font-size: 13px;
 }
+
+.snippet { font-size: 13px; color: var(--muted); line-height: 1.6; font-weight: 300; }
+.snippet mark { background: rgba(255,159,28,0.18); color: var(--orange); padding: 1px 3px; border-radius: 3px; }
+
+
 </style>
 </head>
 <body>
@@ -267,22 +272,26 @@ function renderResults() {
   const qTokens = queryTokens();
 
   const cards = sorted.map(job => {
-    const chips = job.skills.slice(0, 8).map(s => {
-      const isMatch = s.toLowerCase().split(/[^a-z0-9+#.]+/).some(t => qTokens.has(t));
-      return `<div class="chip ${isMatch ? "matched" : ""}">${escapeHtml(s)}</div>`;
-    }).join("");
-
     const loc = Array.isArray(job.location) ? job.location.join(", ") : job.location;
+
+    // Archived records carry a skills array; live API records carry a snippet.
+    const body = (job.skills && job.skills.length)
+      ? `<div class="skill-chips">${job.skills.slice(0, 8).map(s => {
+          const isMatch = s.toLowerCase().split(/[^a-z0-9+#.]+/).some(t => qTokens.has(t));
+          return `<div class="chip ${isMatch ? "matched" : ""}">${escapeHtml(s)}</div>`;
+        }).join("")}</div>`
+      : `<div class="snippet">${highlight(job.snippet || "")}</div>`;
 
     return `
       <div class="job-card">
         <div class="job-title"><a href="${job.url}" target="_blank" rel="noopener">${escapeHtml(job.title)}</a></div>
         <div class="job-meta">
+          ${job.company ? `<span>🏢 ${escapeHtml(job.company)}</span>` : ""}
           ${loc ? `<span>📍 ${escapeHtml(loc)}</span>` : ""}
           ${job.experience ? `<span>⏳ ${escapeHtml(job.experience)}</span>` : ""}
           ${job.salary ? `<span>💰 ${escapeHtml(job.salary)}</span>` : ""}
         </div>
-        <div class="skill-chips">${chips}</div>
+        ${body}
       </div>`;
   }).join("");
 
@@ -304,6 +313,19 @@ function escapeHtml(str) {
   div.textContent = str ?? "";
   return div.innerHTML;
 }
+
+function highlight(text) {
+  const safe = escapeHtml(text);
+  const terms = [...queryTokens()].filter(t => t.length > 2);
+  if (!terms.length) return safe;
+  const pattern = new RegExp(`\\b(${terms.map(escapeRegex).join("|")})`, "gi");
+  return safe.replace(pattern, '<mark>$1</mark>');
+}
+
+function escapeRegex(str) {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 
 function attachTilt() {
   document.querySelectorAll(".job-card").forEach(card => {

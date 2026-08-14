@@ -6,6 +6,7 @@ import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
@@ -13,6 +14,8 @@ from fastapi.staticfiles import StaticFiles
 
 from backend.models import HealthResponse, SearchResponse
 from backend.search_engine import DataLoadError, engine
+
+load_dotenv()
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -70,6 +73,8 @@ def health() -> HealthResponse:
     return HealthResponse(
         status="ok" if engine.is_ready else "degraded",
         jobs_indexed=len(engine.jobs),
+        background_corpus_size=engine.background_size,
+        source=engine.source,
     )
 
 
