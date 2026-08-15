@@ -70,6 +70,44 @@ CONTRACT_ALIASES = {
 # Country-level values match everything, so they are not useful as filters.
 LOCATION_STOPWORDS = {"india", "remote", "anywhere"}
 
+# Location strings arrive at inconsistent granularity: some records carry
+# "Pune, Maharashtra" (state) while others carry a bare "Bangalore" (city) or
+# a district like "Gautam Buddha Nagar". Mapping known cities and districts to
+# their state keeps the filter list at one consistent level.
+CITY_TO_STATE = {
+    "bangalore": "Karnataka", "bengaluru": "Karnataka", "mysore": "Karnataka",
+    "mysuru": "Karnataka", "mangalore": "Karnataka", "hubli": "Karnataka",
+    "mumbai": "Maharashtra", "pune": "Maharashtra", "nagpur": "Maharashtra",
+    "thane": "Maharashtra", "nashik": "Maharashtra", "navi mumbai": "Maharashtra",
+    "aurangabad": "Maharashtra",
+    "hyderabad": "Telangana", "secunderabad": "Telangana", "warangal": "Telangana",
+    "chennai": "Tamil Nadu", "coimbatore": "Tamil Nadu", "madurai": "Tamil Nadu",
+    "salem": "Tamil Nadu", "tiruchirappalli": "Tamil Nadu",
+    "delhi": "Delhi", "new delhi": "Delhi",
+    "noida": "Uttar Pradesh", "ghaziabad": "Uttar Pradesh",
+    "gautam buddha nagar": "Uttar Pradesh", "lucknow": "Uttar Pradesh",
+    "kanpur": "Uttar Pradesh", "varanasi": "Uttar Pradesh", "agra": "Uttar Pradesh",
+    "gurgaon": "Haryana", "gurugram": "Haryana", "faridabad": "Haryana",
+    "panchkula": "Haryana",
+    "kolkata": "West Bengal", "howrah": "West Bengal", "siliguri": "West Bengal",
+    "ahmedabad": "Gujarat", "surat": "Gujarat", "vadodara": "Gujarat",
+    "rajkot": "Gujarat", "gandhinagar": "Gujarat",
+    "jaipur": "Rajasthan", "jodhpur": "Rajasthan", "udaipur": "Rajasthan",
+    "kochi": "Kerala", "ernakulam": "Kerala", "thiruvananthapuram": "Kerala",
+    "trivandrum": "Kerala", "kozhikode": "Kerala", "calicut": "Kerala",
+    "thrissur": "Kerala",
+    "indore": "Madhya Pradesh", "bhopal": "Madhya Pradesh",
+    "jabalpur": "Madhya Pradesh", "gwalior": "Madhya Pradesh",
+    "mohali": "Punjab", "ludhiana": "Punjab", "amritsar": "Punjab",
+    "jalandhar": "Punjab",
+    "bhubaneswar": "Odisha", "khordha": "Odisha", "cuttack": "Odisha",
+    "visakhapatnam": "Andhra Pradesh", "vijayawada": "Andhra Pradesh",
+    "guntur": "Andhra Pradesh", "tirupati": "Andhra Pradesh",
+    "patna": "Bihar", "ranchi": "Jharkhand", "raipur": "Chhattisgarh",
+    "dehradun": "Uttarakhand", "guwahati": "Assam",
+    "chandigarh": "Chandigarh", "goa": "Goa", "panaji": "Goa",
+}
+
 # How many BM25 candidates to re-rank per requested result.
 CANDIDATE_MULTIPLIER = 5
 
@@ -95,6 +133,34 @@ def jaccard_similarity(a: set[str], b: set[str]) -> float:
         return 0.0
     union = a | b
     return len(a & b) / len(union) if union else 0.0
+
+
+def normalise_location(value: str | None) -> str:
+    """
+    Reduce a location string to a single state or union territory.
+
+    Tries the broadest component first, then falls back to any component that
+    maps to a known state. "Pune, Maharashtra" and a bare "Pune" both resolve
+    to Maharashtra.
+    """
+    if not value:
+        return ""
+
+    parts = [p.strip() for p in str(value).split(",") if p.strip()]
+    if not parts:
+        return ""
+
+    # Prefer the last component - usually already the state.
+    for candidate in (parts[-1], *reversed(parts[:-1])):
+        key = candidate.casefold()
+        if key in LOCATION_STOPWORDS:
+            continue
+        if key in CITY_TO_STATE:
+            return CITY_TO_STATE[key]
+
+    # Nothing recognised: keep the broadest component unless it is a stopword.
+    last = parts[-1]
+    return "" if last.casefold() in LOCATION_STOPWORDS else last
 
 
 def normalise_contract(value: str | None) -> str:
@@ -314,9 +380,14 @@ class JobSearchEngine:
         if location:
             needle = location.casefold()
             places = job.get("location") or []
-            # Substring match: stored values look like "Hyderabad, Telangana",
-            # so filtering on "Hyderabad" should still hit.
-            if not any(needle in str(place).casefold() for place in places):
+            # Match either the raw string or its resolved state, so filtering
+            # on "Karnataka" catches a record stored only as "Bangalore".
+            matched = any(
+                needle in str(place).casefold()
+                or needle == normalise_location(place).casefold()
+                for place in places
+            )
+            if not matched:
                 return False
 
         return True
@@ -332,9 +403,11 @@ class JobSearchEngine:
         reports "Full-time"; without mapping, the filter lists the same concept
         twice and neither option covers both sources.
 
-        Locations are reduced to their broadest component and country-level
-        values are dropped, since "India" matches nearly every listing and is
-        therefore useless as a filter.
+        Locations are resolved to a single state. The source data mixes
+        granularity - "Pune, Maharashtra" alongside a bare "Bangalore" - so
+        cities and districts are mapped to their state to keep the list at one
+        consistent level. Country-level values are dropped, since "India"
+        matches nearly every listing.
         """
         sources: set[str] = set()
         contracts: set[str] = set()
@@ -349,15 +422,9 @@ class JobSearchEngine:
                 contracts.add(canonical)
 
             for place in job.get("location") or []:
-                parts = [p.strip() for p in str(place).split(",") if p.strip()]
-                if not parts:
-                    continue
-                # Last component is the broadest available: "Pune, Maharashtra"
-                # gives Maharashtra, while a bare "Bangalore" gives Bangalore.
-                region = parts[-1]
-                if region.casefold() in LOCATION_STOPWORDS:
-                    continue
-                regions[region] += 1
+                state = normalise_location(place)
+                if state:
+                    regions[state] += 1
 
         return {
             "sources": sorted(sources),

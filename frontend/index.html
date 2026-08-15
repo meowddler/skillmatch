@@ -187,19 +187,61 @@ button.primary:disabled { opacity: 0.6; cursor: default; transform: none; }
   color: var(--muted);
 }
 
-.filters { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 16px; align-items: center; }
+.filters {
+  display: flex; flex-wrap: wrap; gap: 10px;
+  margin-top: 18px; align-items: center;
+}
+
 .filters select {
   width: auto; min-width: 150px; margin: 0; cursor: pointer;
-  font-size: 13px; padding: 9px 12px;
+  font-family: 'DM Sans', sans-serif; font-size: 13px; font-weight: 300;
+  color: var(--muted);
+  padding: 10px 34px 10px 16px;
+  background: rgba(6, 9, 14, 0.7);
+  border: 1px solid rgba(255,255,255,0.08);
+  border-radius: 50px;
+  appearance: none; -webkit-appearance: none;
+  /* Custom chevron - the native one can't be themed */
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' stroke='%238f9aa3' stroke-width='1.5' fill='none' stroke-linecap='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 14px center;
+  transition: border-color 0.25s, color 0.25s, box-shadow 0.25s;
 }
-.clear-filters {
-  background: transparent; border: 1px solid var(--border); color: var(--muted);
-  padding: 8px 16px; font-size: 12px; border-radius: 50px;
-  text-transform: none; letter-spacing: normal; font-family: 'DM Sans', sans-serif;
-  font-weight: 400; box-shadow: none;
-}
-.clear-filters:hover { color: var(--text); border-color: rgba(255,159,28,0.4); transform: none; }
 
+.filters select:hover { border-color: rgba(255,159,28,0.3); color: var(--text); }
+
+.filters select:focus {
+  outline: none;
+  border-color: rgba(255,159,28,0.45);
+  box-shadow: 0 0 0 3px rgba(255,159,28,0.1);
+}
+
+/* An active filter picks up the accent so it's obvious something is applied */
+.filters select.active {
+  color: var(--orange);
+  border-color: rgba(255,159,28,0.35);
+  background-color: rgba(255,159,28,0.07);
+}
+
+.filters select option { background: #0d1117; color: var(--text); }
+
+.clear-filters {
+  padding: 9px 18px; border-radius: 50px; cursor: pointer;
+  font-family: 'DM Sans', sans-serif; font-size: 12px; font-weight: 400;
+  text-transform: none; letter-spacing: normal;
+  color: var(--red);
+  background: transparent;
+  border: 1px solid rgba(255,78,80,0.3);
+  box-shadow: none;
+  transition: background 0.25s, color 0.25s;
+}
+
+.clear-filters:hover {
+  background: rgba(255,78,80,0.1);
+  color: #ff7b7c;
+  transform: none;
+  box-shadow: none;
+}
 </style>
 </head>
 <body>
@@ -243,18 +285,10 @@ document.getElementById("queryInput").addEventListener("keydown", e => {
 });
 
 async function runSearch() {
-  const params = new URLSearchParams({ q: query, top_k: 20 });
-    const source = document.getElementById("fSource").value;
-    const location = document.getElementById("fLocation").value;
-    const contract = document.getElementById("fContract").value;
-    if (source) params.set("source", source);
-    if (location) params.set("location", location);
-    if (contract) params.set("contract", contract);
-
-    document.getElementById("clearBtn").style.display =
-      (source || location || contract) ? "inline-block" : "none";
-
-    const res = await fetch(`${API_BASE}/api/search?${params}`);
+  const q = document.getElementById("queryInput").value.trim();
+  const btn = document.getElementById("searchBtn");
+  const errorBox = document.getElementById("errorBox");
+  const area = document.getElementById("resultsArea");
 
   errorBox.innerHTML = "";
   if (!q) {
@@ -262,12 +296,23 @@ async function runSearch() {
     return;
   }
 
+  const params = new URLSearchParams({ q, top_k: 20 });
+  const source = document.getElementById("fSource").value;
+  const location = document.getElementById("fLocation").value;
+  const contract = document.getElementById("fContract").value;
+  if (source) params.set("source", source);
+  if (location) params.set("location", location);
+  if (contract) params.set("contract", contract);
+
+  document.getElementById("clearBtn").style.display =
+    (source || location || contract) ? "inline-block" : "none";
+
   btn.disabled = true;
   btn.textContent = "Analyzing...";
-  area.innerHTML = `<div class="loading"><div class="spinner"></div>Scoring 31,970 jobs...</div>`;
+  area.innerHTML = `<div class="loading"><div class="spinner"></div>Searching...</div>`;
 
   try {
-    const res = await fetch(`${API_BASE}/api/search?q=${encodeURIComponent(q)}&top_k=20`);
+    const res = await fetch(`${API_BASE}/api/search?${params}`);
     if (!res.ok) throw new Error("Search failed");
     const data = await res.json();
 
@@ -394,7 +439,10 @@ async function loadFilters() {
         el.appendChild(opt);
       });
       // Re-run the search when a filter changes, but only if one is active.
-      el.addEventListener("change", () => { if (currentQuery) runSearch(); });
+      el.addEventListener("change", () => {
+        el.classList.toggle("active", !!el.value);
+        if (currentQuery) runSearch();
+      });
     };
 
     fill("fSource", data.sources);
@@ -407,9 +455,11 @@ async function loadFilters() {
 }
 
 function clearFilters() {
-  ["fSource", "fLocation", "fContract"].forEach(id => document.getElementById(id).value = "");
-  document.getElementById("clearBtn").style.display = "none";
-  if (currentQuery) runSearch();
+  ["fSource", "fLocation", "fContract"].forEach(id => {
+    const el = document.getElementById(id);
+    el.value = "";
+    el.classList.remove("active");
+  });
 }
 
 loadFilters();

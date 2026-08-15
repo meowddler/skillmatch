@@ -614,3 +614,89 @@ def test_filter_options_drops_country_level_locations(tmp_path):
     assert "India" not in locations
     assert "Remote" not in locations
     assert "Maharashtra" in locations
+
+
+# --- location normalisation -------------------------------------------------
+
+def test_normalise_location_prefers_state_component():
+    from backend.search_engine import normalise_location
+
+    assert normalise_location("Pune, Maharashtra") == "Maharashtra"
+
+
+def test_normalise_location_maps_bare_city_to_state():
+    """Adzuna stores some records with only a city name."""
+    from backend.search_engine import normalise_location
+
+    assert normalise_location("Bangalore") == "Karnataka"
+    assert normalise_location("Hyderabad") == "Telangana"
+
+
+def test_normalise_location_maps_districts():
+    from backend.search_engine import normalise_location
+
+    assert normalise_location("Gautam Buddha Nagar") == "Uttar Pradesh"
+    assert normalise_location("Khordha") == "Odisha"
+
+
+def test_normalise_location_drops_country_level():
+    from backend.search_engine import normalise_location
+
+    assert normalise_location("India") == ""
+    assert normalise_location("Remote") == ""
+
+
+def test_normalise_location_falls_back_to_city_component():
+    """A city, state pair still resolves when the city is the known one."""
+    from backend.search_engine import normalise_location
+
+    assert normalise_location("Kochi, India") == "Kerala"
+
+
+def test_normalise_location_keeps_unknown_values():
+    from backend.search_engine import normalise_location
+
+    assert normalise_location("Somewhereville") == "Somewhereville"
+
+
+def test_filter_options_are_all_states(tmp_path):
+    """Cities and states in the source data collapse to one consistent level."""
+    import json
+
+    path = tmp_path / "live.json"
+    path.write_text(
+        json.dumps([
+            {"title": "A", "url": "a", "location": ["Bangalore"], "search_text": "python django"},
+            {"title": "B", "url": "b", "location": ["Pune, Maharashtra"], "search_text": "python flask"},
+            {"title": "C", "url": "c", "location": ["Ghaziabad"], "search_text": "python celery"},
+            {"title": "D", "url": "d", "location": ["Mumbai"], "search_text": "java spring"},
+        ]),
+        encoding="utf-8",
+    )
+    eng = JobSearchEngine(data_path=path, background_path=None)
+    eng.load()
+
+    locations = set(eng.filter_options(min_listings=1)["locations"])
+    assert locations == {"Karnataka", "Maharashtra", "Uttar Pradesh"}
+
+
+def test_state_filter_matches_city_only_records(tmp_path):
+    """Filtering on Karnataka must catch a record stored as just 'Bangalore'."""
+    import json
+
+    records = [
+        {"title": "A", "url": "a", "location": ["Bangalore"], "search_text": "python django"},
+        {"title": "B", "url": "b", "location": ["Chennai"], "search_text": "python flask"},
+    ] + [
+        {"title": f"F{i}", "url": f"f{i}", "location": ["Delhi"], "search_text": "java spring"}
+        for i in range(8)
+    ]
+
+    path = tmp_path / "live.json"
+    path.write_text(json.dumps(records), encoding="utf-8")
+
+    eng = JobSearchEngine(data_path=path, background_path=None)
+    eng.load()
+
+    results = eng.search("python", location="Karnataka")
+    assert {r["url"] for r in results} == {"a"}
