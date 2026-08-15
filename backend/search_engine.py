@@ -111,6 +111,18 @@ CITY_TO_STATE = {
 # How many BM25 candidates to re-rank per requested result.
 CANDIDATE_MULTIPLIER = 5
 
+# Field weights for the combined score.
+#
+# A flat index treats "Penetration Tester" in a job title the same as "works
+# alongside our penetration testing team" in paragraph four of an AI role's
+# description. Scoring the title separately and weighting it heavily fixes
+# that: incidental mentions still rank, but never above jobs actually about
+# the thing being searched for.
+#
+# This is the idea behind BM25F, the fielded variant of BM25.
+TITLE_WEIGHT = 2.5
+BODY_WEIGHT = 1.0
+
 # Ceiling on how many result slots diversification may reassign. Relevance
 # stays primary: only this many places can be given to an under-represented
 # source, and only when that source has a genuinely scoring result available.
@@ -173,14 +185,24 @@ def normalise_contract(value: str | None) -> str:
 
 def document_text(job: dict) -> str:
     """
-    Build the indexable text for a job record.
+    Build the full indexable text for a job record.
 
-    Live records (Jooble) carry a prepared `search_text` field. Archived records
-    carry a structured `skills` list instead.
+    Live records carry a prepared `search_text` field. Archived records carry a
+    structured `skills` list instead.
     """
     if job.get("search_text"):
         return job["search_text"]
     return " ".join(job.get("skills") or [])
+
+
+def title_text(job: dict) -> str:
+    """
+    The high-signal field: job title plus the search category it came from.
+
+    Kept separate from the body so a match here can be weighted far more
+    heavily than the same term appearing anywhere in a long description.
+    """
+    return f"{job.get('title', '')} {job.get('category', '')}".strip()
 
 
 class JobSearchEngine:
@@ -199,6 +221,7 @@ class JobSearchEngine:
 
         self.jobs: list[dict] = []
         self.bm25: BM25Okapi | None = None
+        self.bm25_title: BM25Okapi | None = None
         self.background_size: int = 0
         self.source: str = "none"
 
@@ -262,6 +285,7 @@ class JobSearchEngine:
             jobs, self.source = read_json_list(self.data_path), "local"
 
         corpus: list[list[str]] = []
+        title_corpus: list[list[str]] = []
         valid_jobs: list[dict] = []
         job_tokens: list[set[str]] = []
 
@@ -270,6 +294,8 @@ class JobSearchEngine:
             if not tokens:
                 continue
             corpus.append(tokens)
+            # May be empty for archived records, which have no title field.
+            title_corpus.append(tokenize(title_text(job)) or ["__notitle__"])
             job_tokens.append(set(tokens))
             valid_jobs.append(job)
 
@@ -279,6 +305,7 @@ class JobSearchEngine:
         self.jobs = valid_jobs
         self._job_tokens = job_tokens
         self.bm25 = BM25Okapi(corpus)
+        self.bm25_title = BM25Okapi(title_corpus)
 
         # Override the small-corpus IDF with background estimates where available.
         background = self._background_idf()
@@ -287,18 +314,22 @@ class JobSearchEngine:
             # Terms unseen in the background corpus are treated as maximally rare.
             unseen = max(positive) if positive else 0.0
 
-            merged = {
-                term: background.get(term, unseen) for term in self.bm25.idf
-            }
-            average = sum(merged.values()) / len(merged) if merged else 0.0
+            # Both indexes get the same term statistics, so their scores stay
+            # on a comparable scale when combined.
+            for index in (self.bm25, self.bm25_title):
+                merged = {
+                    term: background.get(term, unseen) for term in index.idf
+                }
+                average = sum(merged.values()) / len(merged) if merged else 0.0
 
-            # rank_bm25 floors non-positive IDF at epsilon * average_idf so that
-            # very common terms never subtract from a document's score.
-            floor = self.bm25.epsilon * average
-            self.bm25.idf = {
-                term: (value if value > 0 else floor) for term, value in merged.items()
-            }
-            self.bm25.average_idf = average
+                # rank_bm25 floors non-positive IDF at epsilon * average_idf so
+                # very common terms never subtract from a document's score.
+                floor = index.epsilon * average
+                index.idf = {
+                    term: (value if value > 0 else floor)
+                    for term, value in merged.items()
+                }
+                index.average_idf = average
 
         logger.info("Indexed %d jobs with BM25 (source: %s).", len(self.jobs), self.source)
 
@@ -458,7 +489,9 @@ class JobSearchEngine:
         if not query_tokens:
             return []
 
-        scores = self.bm25.get_scores(query_tokens)
+        body_scores = self.bm25.get_scores(query_tokens)
+        title_scores = self.bm25_title.get_scores(query_tokens)
+        scores = BODY_WEIGHT * body_scores + TITLE_WEIGHT * title_scores
 
         filtering = any((source, location, contract))
 

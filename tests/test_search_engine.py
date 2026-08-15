@@ -700,3 +700,97 @@ def test_state_filter_matches_city_only_records(tmp_path):
 
     results = eng.search("python", location="Karnataka")
     assert {r["url"] for r in results} == {"a"}
+
+
+# --- field-weighted scoring -------------------------------------------------
+
+def test_title_text_combines_title_and_category():
+    from backend.search_engine import title_text
+
+    job = {"title": "Penetration Tester", "category": "security engineer"}
+    assert title_text(job) == "Penetration Tester security engineer"
+
+
+def test_title_text_handles_missing_fields():
+    from backend.search_engine import title_text
+
+    assert title_text({}) == ""
+
+
+@pytest.fixture
+def incidental_engine(tmp_path):
+    """
+    A corpus containing the real failure case: a job in an unrelated field
+    whose description mentions the searched term in passing.
+    """
+    import json
+
+    records = [
+        {"title": "Penetration Tester", "category": "penetration tester",
+         "url": "match", "search_text": "Penetration Tester conduct penetration testing engagements"},
+        {"title": "AI Engineer", "category": "ai engineer", "url": "incidental",
+         "search_text": "AI Engineer build llm pipelines pytorch transformers deployment "
+                        "collaborate with penetration testing teams on model security"},
+    ] + [
+        {"title": "Java Developer", "category": "java developer", "url": f"f{i}",
+         "search_text": "Java Developer spring hibernate maven kafka"}
+        for i in range(20)
+    ]
+
+    path = tmp_path / "live.json"
+    path.write_text(json.dumps(records), encoding="utf-8")
+
+    eng = JobSearchEngine(data_path=path, background_path=None)
+    eng.load()
+    return eng
+
+
+def test_title_match_outranks_incidental_mention(incidental_engine):
+    results = incidental_engine.search("penetration testing", top_k=5)
+    assert results[0]["url"] == "match"
+
+
+def test_incidental_mention_still_appears(incidental_engine):
+    """The AI job genuinely contains the term - it should rank, just lower."""
+    urls = [r["url"] for r in incidental_engine.search("penetration testing", top_k=5)]
+    assert "incidental" in urls
+    assert urls.index("match") < urls.index("incidental")
+
+
+def test_field_weighting_widens_the_gap(incidental_engine, monkeypatch):
+    """Weighting the title should separate a real match from a passing one."""
+    import backend.search_engine as se
+
+    weighted = {r["url"]: r["bm25_score"] for r in incidental_engine.search("penetration testing", top_k=5)}
+
+    monkeypatch.setattr(se, "TITLE_WEIGHT", 0.0)
+    flat = {r["url"]: r["bm25_score"] for r in incidental_engine.search("penetration testing", top_k=5)}
+
+    weighted_gap = weighted["match"] / weighted["incidental"]
+    flat_gap = flat["match"] / flat["incidental"]
+    assert weighted_gap > flat_gap
+
+
+def test_both_indexes_are_built(incidental_engine):
+    assert incidental_engine.bm25 is not None
+    assert incidental_engine.bm25_title is not None
+
+
+def test_archived_records_without_titles_still_index(tmp_path):
+    """The archive has skills but no title field; indexing must not break."""
+    import json
+
+    path = tmp_path / "archive.json"
+    path.write_text(
+        json.dumps([
+            {"skills": ["Python", "Django"]},
+            {"skills": ["Java", "Spring"]},
+            {"skills": ["Kubernetes", "Docker"]},
+        ]),
+        encoding="utf-8",
+    )
+    eng = JobSearchEngine(data_path=path, background_path=None)
+    eng.load()
+
+    assert len(eng.jobs) == 3
+    assert eng.search("python") != []
