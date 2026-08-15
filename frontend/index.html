@@ -243,7 +243,7 @@ document.getElementById("queryInput").addEventListener("keydown", e => {
 });
 
 async function runSearch() {
-  const params = new URLSearchParams({ q, top_k: 20 });
+  const params = new URLSearchParams({ q: query, top_k: 20 });
     const source = document.getElementById("fSource").value;
     const location = document.getElementById("fLocation").value;
     const contract = document.getElementById("fContract").value;
