@@ -12,7 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from backend.models import HealthResponse, SearchResponse
+from backend.models import FilterOptions, HealthResponse, SearchResponse
 from backend.search_engine import DataLoadError, engine
 
 load_dotenv()
@@ -54,17 +54,39 @@ app.add_middleware(
 def search(
     q: str = Query(..., min_length=1, max_length=500, description="Skills, comma-separated or free text"),
     top_k: int = Query(20, ge=1, le=50, description="Number of results to return"),
+    diversify: bool = Query(
+        False,
+        description="Reserve a few slots for job sources that pure relevance ranking would exclude.",
+    ),
+    source: str | None = Query(None, description="Restrict to one job source."),
+    location: str | None = Query(None, description="Restrict to a city, state or region."),
+    contract: str | None = Query(None, description="Restrict to a contract type, e.g. full_time."),
 ) -> SearchResponse:
     """Rank job listings against the given skills."""
     if not engine.is_ready:
         raise HTTPException(status_code=503, detail="Search index is unavailable.")
 
     try:
-        results = engine.search(q, top_k=top_k)
+        results = engine.search(
+            q,
+            top_k=top_k,
+            diversify_sources=diversify,
+            source=source,
+            location=location,
+            contract=contract,
+        )
     except DataLoadError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
     return SearchResponse(query=q, count=len(results), results=results)
+
+
+@app.get("/api/filters", response_model=FilterOptions)
+def filters() -> FilterOptions:
+    """Distinct values available for each filter, for populating the UI."""
+    if not engine.is_ready:
+        raise HTTPException(status_code=503, detail="Search index is unavailable.")
+    return FilterOptions(**engine.filter_options())
 
 
 @app.get("/api/health", response_model=HealthResponse)

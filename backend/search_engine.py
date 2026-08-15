@@ -28,6 +28,7 @@ from __future__ import annotations
 import logging
 import math
 import re
+from collections import Counter
 from pathlib import Path
 
 from rank_bm25 import BM25Okapi
@@ -47,8 +48,35 @@ _TOKEN_SPLIT = re.compile(r"[^a-z0-9+#.]+")
 # User input may separate skills with commas, newlines, or natural conjunctions.
 _SKILL_SPLIT = re.compile(r"[,\n;]|\band\b|&")
 
+# The two job APIs report contract types with different vocabularies and
+# casing - Adzuna sends "full_time", Jooble sends "Full-time". Mapping both to
+# a canonical label stops the same concept appearing twice in the filter list.
+CONTRACT_ALIASES = {
+    "full_time": "Full-time",
+    "full-time": "Full-time",
+    "fulltime": "Full-time",
+    "permanent": "Full-time",
+    "part_time": "Part-time",
+    "part-time": "Part-time",
+    "parttime": "Part-time",
+    "contract": "Contract",
+    "contractor": "Contract",
+    "temporary": "Contract",
+    "temp": "Contract",
+    "internship": "Internship",
+    "intern": "Internship",
+}
+
+# Country-level values match everything, so they are not useful as filters.
+LOCATION_STOPWORDS = {"india", "remote", "anywhere"}
+
 # How many BM25 candidates to re-rank per requested result.
 CANDIDATE_MULTIPLIER = 5
+
+# Ceiling on how many result slots diversification may reassign. Relevance
+# stays primary: only this many places can be given to an under-represented
+# source, and only when that source has a genuinely scoring result available.
+MAX_DIVERSITY_SWAPS = 3
 
 
 def tokenize(text: str) -> list[str]:
@@ -67,6 +95,14 @@ def jaccard_similarity(a: set[str], b: set[str]) -> float:
         return 0.0
     union = a | b
     return len(a & b) / len(union) if union else 0.0
+
+
+def normalise_contract(value: str | None) -> str:
+    """Map a source-specific contract label onto a canonical one."""
+    if not value:
+        return ""
+    key = value.strip().casefold().replace(" ", "_")
+    return CONTRACT_ALIASES.get(key, value.strip().title())
 
 
 def document_text(job: dict) -> str:
@@ -202,8 +238,152 @@ class JobSearchEngine:
 
     # -- search --------------------------------------------------------------
 
-    def search(self, query: str, top_k: int = 20) -> list[dict]:
-        """Return up to `top_k` jobs ranked by BM25, each with a Jaccard score."""
+    def _promote_missing_sources(
+        self,
+        head: list[dict],
+        scores,
+        query_token_set: set[str],
+        top_k: int,
+    ) -> list[dict]:
+        """
+        Guarantee under-represented sources a foothold in the results.
+
+        Listings are aggregated from several job APIs that return different
+        amounts of text. Sources with fuller descriptions have more terms
+        available to match, so they can dominate on relevance alone even when a
+        sparser source holds a comparable listing.
+
+        This looks across the *entire* scored corpus - not just the candidate
+        pool, which the dominant source may fill completely - and reassigns at
+        most MAX_DIVERSITY_SWAPS of the weakest slots to the best-scoring
+        result from each absent source. The cap keeps relevance primary.
+        """
+        present = {job.get("source") for job in head}
+        chosen_urls = {job["url"] for job in head}
+
+        # Best-scoring index per source that isn't already represented.
+        best_by_source: dict[str, int] = {}
+        for idx, job in enumerate(self.jobs):
+            source = job.get("source")
+            if not source or source in present or scores[idx] <= 0:
+                continue
+            if job.get("url") in chosen_urls:
+                continue
+            current = best_by_source.get(source)
+            if current is None or scores[idx] > scores[current]:
+                best_by_source[source] = idx
+
+        if not best_by_source:
+            return head
+
+        # Strongest absent sources first, capped.
+        ordered = sorted(best_by_source.items(), key=lambda kv: scores[kv[1]], reverse=True)
+        swaps = min(len(ordered), MAX_DIVERSITY_SWAPS, max(0, top_k - 1))
+
+        promotions = [
+            {
+                **self.jobs[idx],
+                "bm25_score": round(float(scores[idx]), 3),
+                "jaccard_score": round(
+                    jaccard_similarity(self._job_tokens[idx], query_token_set), 3
+                ),
+                "promoted": True,
+            }
+            for _, idx in ordered[:swaps]
+        ]
+
+        kept = head[: max(0, top_k - len(promotions))]
+        merged = kept + promotions
+        merged.sort(key=lambda job: job["bm25_score"], reverse=True)
+        return merged
+
+    @staticmethod
+    def _matches_filters(
+        job: dict,
+        source: str | None,
+        location: str | None,
+        contract: str | None,
+    ) -> bool:
+        """Check a job against the active filters. Absent filters always pass."""
+        if source and job.get("source") != source:
+            return False
+
+        if contract and normalise_contract(job.get("experience")) != normalise_contract(contract):
+            return False
+
+        if location:
+            needle = location.casefold()
+            places = job.get("location") or []
+            # Substring match: stored values look like "Hyderabad, Telangana",
+            # so filtering on "Hyderabad" should still hit.
+            if not any(needle in str(place).casefold() for place in places):
+                return False
+
+        return True
+
+    def filter_options(self, min_listings: int = 3) -> dict[str, list[str]]:
+        """
+        Distinct values available for each filter, for populating the UI.
+
+        Two cleanups happen here, both driven by what the source APIs actually
+        return:
+
+        Contract labels are normalised. Adzuna reports "full_time" where Jooble
+        reports "Full-time"; without mapping, the filter lists the same concept
+        twice and neither option covers both sources.
+
+        Locations are reduced to their broadest component and country-level
+        values are dropped, since "India" matches nearly every listing and is
+        therefore useless as a filter.
+        """
+        sources: set[str] = set()
+        contracts: set[str] = set()
+        regions: Counter = Counter()
+
+        for job in self.jobs:
+            if job.get("source"):
+                sources.add(job["source"])
+
+            canonical = normalise_contract(job.get("experience"))
+            if canonical:
+                contracts.add(canonical)
+
+            for place in job.get("location") or []:
+                parts = [p.strip() for p in str(place).split(",") if p.strip()]
+                if not parts:
+                    continue
+                # Last component is the broadest available: "Pune, Maharashtra"
+                # gives Maharashtra, while a bare "Bangalore" gives Bangalore.
+                region = parts[-1]
+                if region.casefold() in LOCATION_STOPWORDS:
+                    continue
+                regions[region] += 1
+
+        return {
+            "sources": sorted(sources),
+            "contracts": sorted(contracts),
+            # Only regions with enough listings to be worth filtering on.
+            "locations": [
+                name for name, count in regions.most_common(25) if count >= min_listings
+            ],
+        }
+
+    def search(
+        self,
+        query: str,
+        top_k: int = 20,
+        diversify_sources: bool = False,
+        source: str | None = None,
+        location: str | None = None,
+        contract: str | None = None,
+    ) -> list[dict]:
+        """
+        Return up to `top_k` jobs ranked by BM25, each with a Jaccard score.
+
+        Filters are applied to the whole corpus before `top_k` is taken, so a
+        filtered search still returns a full page of results rather than
+        whatever survived from an unfiltered top 20.
+        """
         if not self.is_ready:
             raise DataLoadError("Search engine is not initialised.")
 
@@ -213,18 +393,28 @@ class JobSearchEngine:
 
         scores = self.bm25.get_scores(query_tokens)
 
-        # Stage 1 - candidate generation over the full corpus.
-        pool_size = min(top_k * CANDIDATE_MULTIPLIER, len(scores))
+        filtering = any((source, location, contract))
+
+        # Stage 1 - candidate generation over the full corpus. When filtering,
+        # widen the pool: the best matches overall may not survive the filter.
+        multiplier = CANDIDATE_MULTIPLIER * (6 if filtering else 1)
+        pool_size = min(top_k * multiplier, len(scores))
         candidates = sorted(range(len(scores)), key=scores.__getitem__, reverse=True)[:pool_size]
 
         # Stage 2 - Jaccard re-scoring on the candidate pool only.
         query_token_set = set(tokenize(" ".join(split_skills(query))))
 
-        results: list[dict] = []
+        # Score the whole candidate pool. Diversification needs to look past
+        # the first `top_k` to find results from under-represented sources.
+        pool: list[dict] = []
         for idx in candidates:
             if scores[idx] <= 0:
                 continue
-            results.append(
+            if filtering and not self._matches_filters(
+                self.jobs[idx], source, location, contract
+            ):
+                continue
+            pool.append(
                 {
                     **self.jobs[idx],
                     "bm25_score": round(float(scores[idx]), 3),
@@ -233,10 +423,13 @@ class JobSearchEngine:
                     ),
                 }
             )
-            if len(results) >= top_k:
-                break
 
-        return results
+        head = pool[:top_k]
+        # Skip diversification when a source filter is active - promoting other
+        # sources would directly contradict what the user asked for.
+        if diversify_sources and not source:
+            return self._promote_missing_sources(head, scores, query_token_set, top_k)
+        return head
 
 
 engine = JobSearchEngine()

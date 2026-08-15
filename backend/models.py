@@ -16,16 +16,27 @@ class JobResult(BaseModel):
     location: list[str] = Field(default_factory=list)
     snippet: str = ""
     category: str = ""
-    source: str = ""                     
     skills: list[str] = Field(default_factory=list)
     bm25_score: float = Field(description="BM25 relevance score. Higher is more relevant.")
     jaccard_score: float = Field(ge=0.0, le=1.0, description="Token overlap ratio.")
+    promoted: bool = Field(
+        default=False,
+        description="True when this result was surfaced by source diversification rather than relevance alone.",
+    )
 
 
 class SearchResponse(BaseModel):
     query: str
     count: int
     results: list[JobResult]
+
+
+class FilterOptions(BaseModel):
+    """Distinct values the UI can offer as filters."""
+
+    sources: list[str] = Field(default_factory=list)
+    locations: list[str] = Field(default_factory=list)
+    contracts: list[str] = Field(default_factory=list)
 
 
 class HealthResponse(BaseModel):

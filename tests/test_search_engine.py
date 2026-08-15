@@ -345,3 +345,272 @@ def test_engine_reports_source(tmp_path):
     eng = JobSearchEngine(data_path=path, background_path=None)
     eng.load()
     assert eng.source == "local"
+
+
+# --- source diversification -------------------------------------------------
+
+@pytest.fixture
+def lopsided_engine(tmp_path):
+    """
+    A corpus where one source has far richer text than the other.
+
+    This reproduces the real imbalance between job APIs that return full
+    descriptions and those that return short snippets.
+    """
+    import json
+
+    jobs = [
+        {
+            "title": "Python Developer",
+            "url": f"https://rich/{i}",
+            "company": f"Corp{i}",
+            "source": "rich_source",
+            "search_text": "Python Developer django flask fastapi postgresql celery pytest " * 4,
+        }
+        for i in range(80)
+    ]
+    jobs += [
+        {
+            "title": "Backend Engineer",
+            "url": f"https://sparse/{i}",
+            "company": f"Startup{i}",
+            "source": "sparse_source",
+            "search_text": "Backend Engineer django",
+        }
+        for i in range(10)
+    ]
+    # Unrelated filler so IDF isn't degenerate.
+    jobs += [
+        {
+            "title": "Java Developer",
+            "url": f"https://rich/j{i}",
+            "company": "C",
+            "source": "rich_source",
+            "search_text": "Java Developer spring hibernate maven kafka junit " * 4,
+        }
+        for i in range(60)
+    ]
+
+    path = tmp_path / "live.json"
+    path.write_text(json.dumps(jobs), encoding="utf-8")
+
+    eng = JobSearchEngine(data_path=path, background_path=None)
+    eng.load()
+    return eng
+
+
+def test_relevance_ranking_lets_one_source_dominate(lopsided_engine):
+    """Baseline: without diversification the richer source takes every slot."""
+    results = lopsided_engine.search("django", top_k=20)
+    assert {r["source"] for r in results} == {"rich_source"}
+
+
+def test_diversification_surfaces_missing_source(lopsided_engine):
+    results = lopsided_engine.search("django", top_k=20, diversify_sources=True)
+    assert "sparse_source" in {r["source"] for r in results}
+
+
+def test_diversification_marks_promoted_results(lopsided_engine):
+    results = lopsided_engine.search("django", top_k=20, diversify_sources=True)
+    promoted = [r for r in results if r.get("promoted")]
+    assert promoted
+    assert all(r["source"] == "sparse_source" for r in promoted)
+
+
+def test_diversification_respects_swap_cap(lopsided_engine):
+    from backend.search_engine import MAX_DIVERSITY_SWAPS
+
+    results = lopsided_engine.search("django", top_k=20, diversify_sources=True)
+    assert sum(1 for r in results if r.get("promoted")) <= MAX_DIVERSITY_SWAPS
+
+
+def test_diversification_respects_top_k(lopsided_engine):
+    assert len(lopsided_engine.search("django", top_k=5, diversify_sources=True)) <= 5
+
+
+def test_diversification_is_noop_when_all_sources_present(lopsided_engine):
+    """Nothing should be promoted if every source already appears."""
+    results = lopsided_engine.search("backend engineer django", top_k=20, diversify_sources=True)
+    sources = {r["source"] for r in results}
+    if len(sources) > 1:
+        assert not any(r.get("promoted") for r in results)
+
+
+def test_diversification_never_promotes_zero_score_results(lopsided_engine):
+    results = lopsided_engine.search("django", top_k=20, diversify_sources=True)
+    assert all(r["bm25_score"] > 0 for r in results)
+
+
+def test_diversification_keeps_results_score_ordered(lopsided_engine):
+    results = lopsided_engine.search("django", top_k=20, diversify_sources=True)
+    scores = [r["bm25_score"] for r in results]
+    assert scores == sorted(scores, reverse=True)
+
+
+# --- filtering --------------------------------------------------------------
+
+@pytest.fixture
+def filter_engine(tmp_path):
+    import json
+
+    jobs = [
+        {"title": "Python Developer", "url": "f1", "source": "adzuna",
+         "experience": "full_time", "location": ["Pune, Maharashtra"],
+         "search_text": "Python Developer django flask postgresql"},
+        {"title": "Python Engineer", "url": "f2", "source": "jooble",
+         "experience": "part_time", "location": ["Bangalore, Karnataka"],
+         "search_text": "Python Engineer django celery redis"},
+        {"title": "Python Analyst", "url": "f3", "source": "adzuna",
+         "experience": "full_time", "location": ["Bangalore, Karnataka"],
+         "search_text": "Python Analyst pandas numpy reporting"},
+        {"title": "Java Developer", "url": "f4", "source": "adzuna",
+         "experience": "full_time", "location": ["Pune, Maharashtra"],
+         "search_text": "Java Developer spring hibernate maven"},
+    ]
+    path = tmp_path / "live.json"
+    path.write_text(json.dumps(jobs), encoding="utf-8")
+
+    eng = JobSearchEngine(data_path=path, background_path=None)
+    eng.load()
+    return eng
+
+
+def test_filter_by_source(filter_engine):
+    results = filter_engine.search("python", source="jooble")
+    assert {r["source"] for r in results} == {"jooble"}
+
+
+def test_filter_by_contract(filter_engine):
+    results = filter_engine.search("python", contract="part_time")
+    assert all(r["experience"] == "part_time" for r in results)
+
+
+def test_filter_by_location_matches_substring(filter_engine):
+    """Stored as 'Bangalore, Karnataka' - filtering on the city should hit."""
+    results = filter_engine.search("python", location="Bangalore")
+    assert results
+    assert all("Bangalore" in r["location"][0] for r in results)
+
+
+def test_filter_by_location_is_case_insensitive(filter_engine):
+    assert filter_engine.search("python", location="bangalore")
+
+
+def test_filters_combine(filter_engine):
+    results = filter_engine.search("python", source="adzuna", location="Bangalore")
+    assert all(r["source"] == "adzuna" for r in results)
+    assert all("Bangalore" in r["location"][0] for r in results)
+
+
+def test_filter_excluding_everything_returns_empty(filter_engine):
+    assert filter_engine.search("python", location="Antarctica") == []
+
+
+def test_no_filters_returns_everything_relevant(filter_engine):
+    assert len(filter_engine.search("python")) == 3
+
+
+def test_source_filter_suppresses_diversification(filter_engine):
+    """Promoting other sources would contradict an explicit source filter."""
+    results = filter_engine.search("python", source="adzuna", diversify_sources=True)
+    assert {r["source"] for r in results} == {"adzuna"}
+
+
+def test_filter_options_lists_distinct_values(filter_engine):
+    options = filter_engine.filter_options()
+    assert set(options["sources"]) == {"adzuna", "jooble"}
+    # Raw values are "full_time"/"part_time"; the filter list shows canonical labels.
+    assert set(options["contracts"]) == {"Full-time", "Part-time"}
+
+
+def test_filter_options_uses_region_not_full_location(filter_engine):
+    """Locations collapse to their last component so the list stays usable."""
+    options = filter_engine.filter_options(min_listings=1)
+    assert set(options["locations"]) == {"Maharashtra", "Karnataka"}
+
+
+def test_filter_options_drops_thin_regions(filter_engine):
+    """Regions with too few listings aren't worth offering as a filter."""
+    assert filter_engine.filter_options(min_listings=3)["locations"] == []
+
+
+# --- contract & location normalisation --------------------------------------
+
+def test_normalise_contract_unifies_source_vocabularies():
+    """Adzuna sends 'full_time', Jooble sends 'Full-time'. Same concept."""
+    from backend.search_engine import normalise_contract
+
+    assert normalise_contract("full_time") == "Full-time"
+    assert normalise_contract("Full-time") == "Full-time"
+    assert normalise_contract("permanent") == "Full-time"
+
+
+def test_normalise_contract_groups_temporary_with_contract():
+    from backend.search_engine import normalise_contract
+
+    assert normalise_contract("Temporary") == "Contract"
+    assert normalise_contract("contract") == "Contract"
+
+
+def test_normalise_contract_handles_empty():
+    from backend.search_engine import normalise_contract
+
+    assert normalise_contract("") == ""
+    assert normalise_contract(None) == ""
+
+
+def test_normalise_contract_passes_through_unknown_values():
+    """An unmapped label is title-cased rather than discarded."""
+    from backend.search_engine import normalise_contract
+
+    assert normalise_contract("freelance") == "Freelance"
+
+
+def test_contract_filter_matches_across_source_vocabularies(tmp_path):
+    """Filtering on 'Full-time' must catch Adzuna's 'full_time' too."""
+    import json
+
+    # Filler documents without "python" so the term keeps a positive IDF -
+    # a term present in every document scores zero and returns nothing.
+    records = [
+        {"title": "A", "url": "a", "experience": "full_time", "search_text": "python django"},
+        {"title": "B", "url": "b", "experience": "Full-time", "search_text": "python flask"},
+        {"title": "C", "url": "c", "experience": "part_time", "search_text": "python celery"},
+    ] + [
+        {"title": f"F{i}", "url": f"f{i}", "experience": "full_time",
+         "search_text": "java spring hibernate"}
+        for i in range(8)
+    ]
+
+    path = tmp_path / "live.json"
+    path.write_text(json.dumps(records), encoding="utf-8")
+    eng = JobSearchEngine(data_path=path, background_path=None)
+    eng.load()
+
+    results = eng.search("python", contract="Full-time")
+    assert {r["url"] for r in results} == {"a", "b"}
+
+
+def test_filter_options_drops_country_level_locations(tmp_path):
+    """'India' matches nearly everything, so it isn't offered as a filter."""
+    import json
+
+    path = tmp_path / "live.json"
+    path.write_text(
+        json.dumps([
+            {"title": "A", "url": "a", "location": ["India"],
+             "search_text": "python django"},
+            {"title": "B", "url": "b", "location": ["Pune, Maharashtra"],
+             "search_text": "python flask"},
+            {"title": "C", "url": "c", "location": ["Remote"],
+             "search_text": "python celery"},
+        ]),
+        encoding="utf-8",
+    )
+    eng = JobSearchEngine(data_path=path, background_path=None)
+    eng.load()
+
+    locations = eng.filter_options(min_listings=1)["locations"]
+    assert "India" not in locations
+    assert "Remote" not in locations
+    assert "Maharashtra" in locations

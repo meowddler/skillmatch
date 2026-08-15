@@ -187,6 +187,19 @@ button.primary:disabled { opacity: 0.6; cursor: default; transform: none; }
   color: var(--muted);
 }
 
+.filters { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 16px; align-items: center; }
+.filters select {
+  width: auto; min-width: 150px; margin: 0; cursor: pointer;
+  font-size: 13px; padding: 9px 12px;
+}
+.clear-filters {
+  background: transparent; border: 1px solid var(--border); color: var(--muted);
+  padding: 8px 16px; font-size: 12px; border-radius: 50px;
+  text-transform: none; letter-spacing: normal; font-family: 'DM Sans', sans-serif;
+  font-weight: 400; box-shadow: none;
+}
+.clear-filters:hover { color: var(--text); border-color: rgba(255,159,28,0.4); transform: none; }
+
 </style>
 </head>
 <body>
@@ -202,7 +215,13 @@ button.primary:disabled { opacity: 0.6; cursor: default; transform: none; }
 
     <div class="label">Your Skills</div>
     <textarea id="queryInput" placeholder="e.g. Python, Machine Learning, SQL&#10;or: I know Java and Spring Boot&#10;or: kubernetes docker aws"></textarea>
-
+    <div class="filters" id="filterBar">
+  <select id="fSource"><option value="">All sources</option></select>
+  <select id="fLocation"><option value="">All locations</option></select>
+  <select id="fContract"><option value="">All contract types</option></select>
+  <button class="clear-filters" id="clearBtn" onclick="clearFilters()" style="display:none">Clear</button>
+</div>
+    
     <div class="action-bar">
       <div class="hint">Works with comma-separated skills or natural sentences.</div>
       <button class="primary" id="searchBtn" onclick="runSearch()">Recommend Jobs</button>
@@ -224,10 +243,18 @@ document.getElementById("queryInput").addEventListener("keydown", e => {
 });
 
 async function runSearch() {
-  const q = document.getElementById("queryInput").value.trim();
-  const btn = document.getElementById("searchBtn");
-  const errorBox = document.getElementById("errorBox");
-  const area = document.getElementById("resultsArea");
+  const params = new URLSearchParams({ q, top_k: 20 });
+    const source = document.getElementById("fSource").value;
+    const location = document.getElementById("fLocation").value;
+    const contract = document.getElementById("fContract").value;
+    if (source) params.set("source", source);
+    if (location) params.set("location", location);
+    if (contract) params.set("contract", contract);
+
+    document.getElementById("clearBtn").style.display =
+      (source || location || contract) ? "inline-block" : "none";
+
+    const res = await fetch(`${API_BASE}/api/search?${params}`);
 
   errorBox.innerHTML = "";
   if (!q) {
@@ -351,6 +378,41 @@ function attachTilt() {
     });
   });
 }
+
+async function loadFilters() {
+  try {
+    const res = await fetch(`${API_BASE}/api/filters`);
+    if (!res.ok) return;
+    const data = await res.json();
+
+    const fill = (id, values) => {
+      const el = document.getElementById(id);
+      values.forEach(v => {
+        const opt = document.createElement("option");
+        opt.value = v;
+        opt.textContent = v;
+        el.appendChild(opt);
+      });
+      // Re-run the search when a filter changes, but only if one is active.
+      el.addEventListener("change", () => { if (currentQuery) runSearch(); });
+    };
+
+    fill("fSource", data.sources);
+    fill("fLocation", data.locations);
+    fill("fContract", data.contracts);
+  } catch {
+    // Filters are optional - a failure here shouldn't block search.
+    document.getElementById("filterBar").style.display = "none";
+  }
+}
+
+function clearFilters() {
+  ["fSource", "fLocation", "fContract"].forEach(id => document.getElementById(id).value = "");
+  document.getElementById("clearBtn").style.display = "none";
+  if (currentQuery) runSearch();
+}
+
+loadFilters();
 </script>
 </body>
 </html>

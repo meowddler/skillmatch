@@ -49,3 +49,15 @@ def test_search_result_shape():
         result = c.get("/api/search", params={"q": "java", "top_k": 1}).json()["results"][0]
         for field in ("title", "url", "skills", "bm25_score", "jaccard_score"):
             assert field in result
+
+
+def test_search_accepts_diversify_flag():
+    with TestClient(app) as c:
+        response = c.get("/api/search", params={"q": "python", "diversify": "true"})
+        assert response.status_code == 200
+
+
+def test_diversify_defaults_to_false():
+    with TestClient(app) as c:
+        result = c.get("/api/search", params={"q": "python", "top_k": 1}).json()["results"][0]
+        assert result["promoted"] is False
